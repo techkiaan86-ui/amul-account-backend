@@ -206,3 +206,139 @@ exports.handleGeneralImport = async (req, res) => {
     res.status(500).json({ success: false, message: 'Server error during import.' });
   }
 };
+
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+
+exports.handleAIInvoiceImport = async (req, res) => {
+  try {
+    const companyId = req.user.companyId;
+
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: 'No file uploaded or file exceeds 5MB limit.' });
+    }
+
+    const apiKey = req.body.apiKey || process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ success: false, message: 'AI API key is missing. Please provide it in the UI or .env' });
+    }
+
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({ model: "gemini-3.6-flash" });
+
+    // Prepare file data
+    let mimeType = req.file.mimetype;
+    let fileData = req.file.buffer.toString("base64");
+
+    let prompt = `
+Extract the following information from the provided purchase invoice image/pdf.
+Return ONLY a strictly formatted JSON object following this exact schema without any markdown blocks or additional text:
+{
+  "supplierName": "String",
+  "supplierGstin": "String",
+  "invoiceNumber": "String",
+  "invoiceDate": "YYYY-MM-DD",
+  "items": [
+    {
+      "productName": "String",
+      "hsnCode": "String",
+      "batchNo": "String",
+      "quantity": 10,
+      "unit": "String",
+      "purchasePrice": 150.00,
+      "discountPercent": 0,
+      "taxPercent": 18,
+      "cgst": 9,
+      "sgst": 9,
+      "igst": 0,
+      "amount": 1500.00
+    }
+  ],
+  "subtotal": 1500.00,
+  "totalTax": 270.00,
+  "grandTotal": 1770.00
+}
+Ensure numeric values are numbers, not strings. For missing values, use null or 0.
+`;
+
+    if (req.body.instructions && req.body.instructions.trim() !== '') {
+      prompt += `\nAdditional Instructions from User: ${req.body.instructions.trim()}\n`;
+    }
+
+    const result = await model.generateContent([
+      {
+        inlineData: {
+          data: fileData,
+          mimeType: mimeType
+        }
+      },
+      prompt
+    ]);
+
+    const responseText = result.response.text();
+    const cleanJsonText = responseText.replace(/```json/gi, '').replace(/```/g, '').trim();
+    
+    let extractedData;
+    try {
+      extractedData = JSON.parse(cleanJsonText);
+    } catch (parseError) {
+      console.error("AI returned invalid JSON:", responseText);
+      return res.status(500).json({ success: false, message: 'AI failed to extract structured data. Please try again or manually enter.' });
+    }
+
+    // Smart Entity Matching
+    let matchedSupplierId = null;
+    if (extractedData.supplierName || extractedData.supplierGstin) {
+      const supplierConditions = [];
+      if (extractedData.supplierName) supplierConditions.push({ name: { contains: extractedData.supplierName } });
+      if (extractedData.supplierGstin) supplierConditions.push({ gstin: extractedData.supplierGstin });
+
+      const supplier = await prisma.customer.findFirst({
+        where: {
+          companyId,
+          OR: supplierConditions
+        }
+      });
+      if (supplier) {
+        matchedSupplierId = supplier.id;
+        extractedData.supplierName = supplier.name; // Use system name
+      }
+    }
+
+    const itemsWithProductMatch = [];
+    if (Array.isArray(extractedData.items)) {
+      for (const item of extractedData.items) {
+        let matchedProductId = null;
+        if (item.productName) {
+          const product = await prisma.product.findFirst({
+            where: {
+              companyId,
+              name: { contains: item.productName }
+            }
+          });
+          if (product) {
+            matchedProductId = product.id;
+            item.productName = product.name; // Standardize name
+          }
+        }
+        itemsWithProductMatch.push({
+          ...item,
+          matchedProductId
+        });
+      }
+    }
+
+    extractedData.items = itemsWithProductMatch;
+
+    return res.json({
+      success: true,
+      data: {
+        ...extractedData,
+        matchedSupplierId
+      }
+    });
+
+  } catch (error) {
+    console.error("AI Invoice Import Error:", error);
+    res.status(500).json({ success: false, message: 'An error occurred during AI processing.' });
+  }
+};

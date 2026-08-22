@@ -31,24 +31,28 @@ exports.getLedger = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Customer not found' });
     }
 
-    // 2. Get all SALES invoices (Debit entries)
+    const isSupplier = customer.type === 'COMPANY' || customer.type === 'SUPPLIER';
+    const mainInvoiceType = isSupplier ? 'PURCHASE' : 'SALES';
+    const returnInvoiceType = isSupplier ? 'PURCHASE_RETURN' : 'SALES_RETURN';
+
+    // 2. Get all primary invoices (SALES for customer, PURCHASE for supplier)
     const invoices = await prisma.invoice.findMany({
       where: {
         customerId: parseInt(customerId, 10),
         companyId,
-        type: 'SALES',
+        type: mainInvoiceType,
         deletedAt: null,
         ...dateFilter
       },
       orderBy: { date: 'asc' }
     });
 
-    // 3. Get all SALES RETURN invoices (Credit entries - reduces balance)
-    const salesReturns = await prisma.invoice.findMany({
+    // 3. Get all return invoices
+    const returnInvoices = await prisma.invoice.findMany({
       where: {
         customerId: parseInt(customerId, 10),
         companyId,
-        type: 'SALES_RETURN',
+        type: returnInvoiceType,
         deletedAt: null,
         ...dateFilter
       },
@@ -65,53 +69,84 @@ exports.getLedger = async (req, res) => {
       orderBy: { date: 'asc' }
     });
 
+    // Helper to parse paymentMode strings (handles 'Credit', 'Credit:500', 'Cash:200,Credit:300', 'Cash', etc.)
+    const parsePaymentDetails = (modeStr, totalAmount) => {
+      const str = String(modeStr || 'Cash').trim();
+      let upfrontPaid = 0;
+      let isCredit = false;
+
+      if (str.includes(':')) {
+        const parts = str.split(',');
+        for (const p of parts) {
+          const [m, amt] = p.split(':');
+          if (m && m.trim().toLowerCase() === 'credit') {
+            isCredit = true;
+          } else {
+            upfrontPaid += parseFloat(amt) || 0;
+          }
+        }
+      } else if (str.toLowerCase() === 'credit') {
+        isCredit = true;
+        upfrontPaid = 0;
+      } else {
+        upfrontPaid = totalAmount || 0;
+      }
+
+      return {
+        isCredit,
+        upfrontPaid,
+        normalizedMode: isCredit ? 'Credit' : (str.includes(',') ? 'Split' : str)
+      };
+    };
+
     // 5. Build ledger entries array
     let entries = [];
 
-    // Add sales invoices as DEBIT entries
+    // Add invoices (DEBIT for customer, CREDIT for supplier)
     invoices.forEach(inv => {
-      const isPaid = inv.status === 'PAID' || inv.paymentMode !== 'Credit';
+      const { isCredit, upfrontPaid, normalizedMode } = parsePaymentDetails(inv.paymentMode, inv.totalAmount);
       entries.push({
         id: `INV-${inv.id}`,
         rawId: inv.id,
         type: 'INVOICE',
         date: inv.date,
         voucherNo: inv.invoiceNo,
-        amount: inv.totalAmount,    // Debit (customer owes us)
-        paymentIn: isPaid ? inv.totalAmount : 0, // Credit (payment received)
+        amount: inv.totalAmount,    // Total invoice amount
+        paymentIn: upfrontPaid,     // Upfront paid cash/bank (0 for pure credit)
         discount: inv.totalDiscount || 0,
-        paymentMode: inv.paymentMode || 'Cash',
+        paymentMode: normalizedMode,
+        rawPaymentMode: inv.paymentMode,
         remark: inv.remark || null
       });
     });
 
-    // Add sales returns as CREDIT entries (reduces what customer owes)
-    salesReturns.forEach(ret => {
+    // Add returns
+    returnInvoices.forEach(ret => {
       entries.push({
         id: `RET-${ret.id}`,
         rawId: ret.id,
-        type: 'SALES_RETURN',
+        type: isSupplier ? 'PURCHASE_RETURN' : 'SALES_RETURN',
         date: ret.date,
         voucherNo: ret.invoiceNo,
         amount: 0,
-        paymentIn: ret.totalAmount,  // Treated as credit
+        paymentIn: ret.totalAmount,  // Treated as credit reduction
         discount: 0,
         paymentMode: ret.paymentMode || 'Cash',
-        remark: ret.remark || 'Sales Return'
+        remark: ret.remark || (isSupplier ? 'Purchase Return' : 'Sales Return')
       });
     });
 
     // Add payments from CustomerPayment table
     payments.forEach(pay => {
-      const isIn = pay.paymentType === 'IN';
+      const isCreditReduction = isSupplier ? pay.paymentType === 'OUT' : pay.paymentType === 'IN';
       entries.push({
         id: `PAY-${pay.id}`,
         rawId: pay.id,
-        type: isIn ? 'PAYMENT_IN' : 'PAYMENT_OUT',
+        type: pay.paymentType === 'IN' ? 'PAYMENT_IN' : 'PAYMENT_OUT',
         date: pay.date,
         voucherNo: String(pay.id),
-        amount: isIn ? 0 : pay.amount,       // OUT = debit (we owe them)
-        paymentIn: isIn ? pay.amount : 0,    // IN = credit (they paid us)
+        amount: isCreditReduction ? 0 : pay.amount,
+        paymentIn: isCreditReduction ? pay.amount : 0,
         discount: pay.discount || 0,
         paymentMode: pay.paymentMode || 'Cash',
         remark: pay.remark || null
@@ -122,11 +157,10 @@ exports.getLedger = async (req, res) => {
     entries.sort((a, b) => new Date(a.date) - new Date(b.date));
 
     // 7. Calculate running balance
-    // Balance = total invoiced (debit) - total payments received (credit) - discounts
     let runningBalance = 0;
     entries = entries.map(entry => {
-      runningBalance += entry.amount;       // Debit (invoice raised or payment out)
-      runningBalance -= entry.paymentIn;   // Credit (payment received or return)
+      runningBalance += entry.amount;       // Debit
+      runningBalance -= entry.paymentIn;   // Credit
       runningBalance -= entry.discount;    // Discount reduces balance
       return {
         ...entry,

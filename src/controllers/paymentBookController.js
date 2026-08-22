@@ -1,5 +1,6 @@
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
+const { getAndIncrementVoucherNumber } = require('./voucherController');
 
 // Get all payment books for the tenant
 exports.getPaymentBooks = async (req, res) => {
@@ -180,13 +181,16 @@ exports.addPaymentBookTransaction = async (req, res) => {
     const parsedDiscount = parseFloat(discount) || 0;
 
     const result = await prisma.$transaction(async (tx) => {
+      // Determine voucher type based on payment direction
+      const voucherType = parsedIn > 0 ? 'Customer Payment' : 'Company Payment';
+      const voucherNo = await getAndIncrementVoucherNumber(companyId, voucherType, tx);
       const transaction = await tx.paymentBookTransaction.create({
         data: {
           date: date ? new Date(date) : new Date(),
           paymentIn: parsedIn,
           paymentOut: parsedOut,
           discount: parsedDiscount,
-          remark,
+          remark: remark ? `[${voucherNo}] ${remark}` : `[${voucherNo}]`,
           paymentMode: paymentMode || 'Cash',
           paymentBookId,
           companyId
@@ -209,7 +213,7 @@ exports.addPaymentBookTransaction = async (req, res) => {
           await updateBankBalance(companyId, paymentMode || 'Cash', parsedOut, 'OUT', tx);
       }
 
-      return transaction;
+      return { ...transaction, voucherNo };
     });
 
     res.status(201).json({ success: true, data: result });

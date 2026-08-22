@@ -1,6 +1,7 @@
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 const { updateStock } = require('../services/inventoryService');
+const { getAndIncrementVoucherNumber, mapInvoiceTypeToVoucher } = require('./voucherController');
 
 /**
  * Validates transaction type against allowed enum values
@@ -25,8 +26,7 @@ exports.createTransaction = async (req, res) => {
   } = req.body;
   const companyId = req.user.companyId;
 
-  // Auto-generate invoiceNo if not provided by the client
-  const invoiceNo = req.body.invoiceNo || `${type.toUpperCase()}-${Date.now()}-${Math.floor(100 + Math.random() * 900)}`;
+  // invoiceNo will be generated atomically inside the transaction
 
   if (!isValidTransactionType(type)) {
     return res.status(400).json({ error: "Invalid transaction type" });
@@ -39,10 +39,11 @@ exports.createTransaction = async (req, res) => {
   try {
     // We use a transaction to ensure both invoice creation and stock updates happen atomically
     const result = await prisma.$transaction(async (tx) => {
+      const generatedInvoiceNo = req.body.invoiceNo || await getAndIncrementVoucherNumber(companyId, mapInvoiceTypeToVoucher(type.toUpperCase()), tx);
       // 1. Create the Transaction (Invoice)
       const invoice = await tx.invoice.create({
         data: {
-          invoiceNo,
+          invoiceNo: generatedInvoiceNo,
           date: date ? new Date(date) : new Date(),
           type: type.toUpperCase(),
           subTotal,
@@ -72,6 +73,7 @@ exports.createTransaction = async (req, res) => {
               discount1: item.discount1,
               discount2: item.discount2,
               batchNo: item.batchNo,
+              description: item.description,
               mfgDate: item.mfgDate,
               expDate: item.expDate,
               amount: item.amount,
@@ -93,24 +95,49 @@ exports.createTransaction = async (req, res) => {
       // 2. Update stock depending on transaction type
       await updateStock(items, type.toUpperCase(), warehouseId, toWarehouseId, tx);
 
-      // 3. Update financial ledgers (Customer/Party balance)
-      const parsedCustomerId = customerId ? parseInt(customerId, 10) : null;
-      if (type.toUpperCase() === 'SALES' && status !== 'PAID' && parsedCustomerId && !isNaN(parsedCustomerId)) {
-        // Increase customer balance (they owe us)
-        await tx.customer.update({
-          where: { id: parsedCustomerId },
-          data: { balance: { increment: totalAmount } }
-        });
-      } else if (type.toUpperCase() === 'PURCHASE' && status !== 'PAID' && parsedCustomerId && !isNaN(parsedCustomerId)) {
-        // Increase supplier balance (we owe them)
-        // Note: Assuming customer model acts as party/supplier too
-        await tx.customer.update({
-          where: { id: parsedCustomerId },
-          data: { balance: { increment: totalAmount } }
-        });
+      // 3. Calculate total paid amount from paymentDetails or paymentMode
+      let totalPaid = 0;
+      if (Array.isArray(req.body.paymentDetails) && req.body.paymentDetails.length > 0) {
+        totalPaid = req.body.paymentDetails.reduce((sum, pd) => sum + (parseFloat(pd.amount) || 0), 0);
+      } else if (req.body.paymentMode && req.body.paymentMode.toLowerCase() !== 'credit' && status === 'PAID') {
+        totalPaid = parseFloat(totalAmount) || 0;
       }
 
-      // 4. Update Loyalty Points
+      const dueAmountToAdd = Math.max(0, (parseFloat(totalAmount) || 0) - totalPaid);
+
+      // 4. Update financial ledgers (Customer/Party balance)
+      const parsedCustomerId = customerId ? parseInt(customerId, 10) : null;
+      if (parsedCustomerId && !isNaN(parsedCustomerId)) {
+        if (type.toUpperCase() === 'SALES') {
+          // Increase customer balance ONLY by remaining unpaid due amount
+          if (dueAmountToAdd > 0) {
+            await tx.customer.update({
+              where: { id: parsedCustomerId },
+              data: { balance: { increment: dueAmountToAdd } }
+            });
+          }
+        } else if (type.toUpperCase() === 'PURCHASE') {
+          // Increase supplier balance ONLY by remaining unpaid due amount
+          if (dueAmountToAdd > 0) {
+            await tx.customer.update({
+              where: { id: parsedCustomerId },
+              data: { balance: { increment: dueAmountToAdd } }
+            });
+          }
+        } else if (type.toUpperCase() === 'SALES_RETURN') {
+          await tx.customer.update({
+            where: { id: parsedCustomerId },
+            data: { balance: { decrement: (parseFloat(totalAmount) || 0) - totalPaid } }
+          });
+        } else if (type.toUpperCase() === 'PURCHASE_RETURN') {
+          await tx.customer.update({
+            where: { id: parsedCustomerId },
+            data: { balance: { decrement: (parseFloat(totalAmount) || 0) - totalPaid } }
+          });
+        }
+      }
+
+      // 5. Update Loyalty Points
       if (parsedCustomerId && !isNaN(parsedCustomerId) && (type.toUpperCase() === 'SALES' || type.toUpperCase() === 'PURCHASE')) {
         let earnedPoints = 0;
         for (const item of items) {
@@ -132,57 +159,59 @@ exports.createTransaction = async (req, res) => {
         }
       }
 
-      // 5. Update Bank Balances from paymentDetails
-      if (req.body.paymentDetails && req.body.paymentDetails.length > 0) {
+      // 6. Update Bank Balances from paymentDetails
+      if (Array.isArray(req.body.paymentDetails) && req.body.paymentDetails.length > 0) {
         for (const pd of req.body.paymentDetails) {
           const amt = parseFloat(pd.amount) || 0;
-          const bId = parseInt(pd.bankId, 10);
-          if (amt > 0 && bId && bId !== 9999) {
-            // Verify bank exists to avoid foreign key constraint error
-            const bankExists = await tx.bank.findFirst({ where: { id: bId, companyId } });
-            if (!bankExists) {
-              console.warn(`Bank ID ${bId} not found, skipping bank transaction.`);
-              continue;
+          if (amt > 0) {
+            const bId = parseInt(pd.bankId, 10);
+            let targetBank = null;
+            if (bId && bId !== 9999) {
+              targetBank = await tx.bank.findFirst({ where: { id: bId, companyId } });
+            }
+            if (!targetBank) {
+              targetBank = await tx.bank.findFirst({
+                where: {
+                  companyId,
+                  OR: [
+                    { name: 'Cash' },
+                    { type: 'Cash' },
+                    { type: 'CASH BOOK' },
+                    { type: 'WALLET-BOOK' }
+                  ]
+                }
+              }) || await tx.bank.findFirst({ where: { companyId } });
             }
 
-            let isOutflow = false;
-            if (['PURCHASE', 'SALES_RETURN', 'PURCHASE_ORDER'].includes(type.toUpperCase())) {
-              isOutflow = true; // Money goes out of our bank
-            } else if (['SALES', 'PURCHASE_RETURN', 'SALES_ORDER', 'QUOTATION'].includes(type.toUpperCase())) {
-              isOutflow = false; // Money comes into our bank
-            }
+            if (targetBank) {
+              let isOutflow = false;
+              if (['PURCHASE', 'SALES_RETURN', 'PURCHASE_ORDER'].includes(type.toUpperCase())) {
+                isOutflow = true; // Money goes out of our bank
+              } else if (['SALES', 'PURCHASE_RETURN', 'SALES_ORDER', 'QUOTATION'].includes(type.toUpperCase())) {
+                isOutflow = false; // Money comes into our bank
+              }
 
-            if (isOutflow) {
               await tx.bankTransaction.create({
                 data: {
-                  date: invoice.date,
-                  fromBankId: bId,
+                  date: new Date(),
+                  fromBankId: isOutflow ? targetBank.id : null,
+                  toBankId: isOutflow ? null : targetBank.id,
                   amount: amt,
-                  remark: `${type.toUpperCase()} Payment - ${invoice.invoiceNo}`,
+                  remark: `${type.toUpperCase()} ${isOutflow ? 'Payment' : 'Receipt'} - ${invoice.invoiceNo}`,
                   companyId
                 }
               });
               await tx.bank.update({
-                where: { id: bId },
-                data: { balance: { decrement: amt } }
-              });
-            } else {
-              await tx.bankTransaction.create({
-                data: {
-                  date: invoice.date,
-                  toBankId: bId,
-                  amount: amt,
-                  remark: `${type.toUpperCase()} Receipt - ${invoice.invoiceNo}`,
-                  companyId
-                }
-              });
-              await tx.bank.update({
-                where: { id: bId },
-                data: { balance: { increment: amt } }
+                where: { id: targetBank.id },
+                data: { balance: { increment: isOutflow ? -amt : amt } }
               });
             }
           }
         }
+      } else if (req.body.paymentMode && req.body.paymentMode.toLowerCase() !== 'credit' && status === 'PAID' && (parseFloat(totalAmount) || 0) > 0) {
+         const { updateBankBalance } = require('../services/bankService');
+         let tType = ['PURCHASE', 'SALES_RETURN', 'PURCHASE_ORDER'].includes(type.toUpperCase()) ? 'OUT' : 'IN';
+         await updateBankBalance(companyId, req.body.paymentMode, parseFloat(totalAmount) || 0, tType, tx, `${type.toUpperCase()} ${tType === 'OUT' ? 'Payment' : 'Receipt'} - ${invoice.invoiceNo}`);
       }
 
       return invoice;
@@ -237,7 +266,29 @@ exports.getTransactions = async (req, res) => {
       orderBy: { createdAt: 'desc' }
     });
 
-    res.status(200).json({ data: invoices });
+    const invoiceNos = invoices.map(i => i.invoiceNo);
+    const bankTxs = invoiceNos.length > 0 ? await prisma.bankTransaction.findMany({
+      where: {
+        companyId,
+        OR: invoiceNos.map(no => ({ remark: { contains: no } }))
+      }
+    }) : [];
+
+    const enrichedInvoices = invoices.map(inv => {
+      const relatedTxs = bankTxs.filter(t => t.remark && t.remark.includes(inv.invoiceNo));
+      const paid = relatedTxs.length > 0 
+        ? relatedTxs.reduce((sum, t) => sum + (t.amount || 0), 0)
+        : (inv.status === 'PAID' && inv.paymentMode && inv.paymentMode.toLowerCase() !== 'credit' ? inv.totalAmount : 0);
+      const balance = Math.max(0, (inv.totalAmount || 0) - paid);
+      
+      return {
+        ...inv,
+        paidAmount: paid,
+        balance: balance
+      };
+    });
+
+    res.status(200).json({ data: enrichedInvoices });
   } catch (error) {
     res.status(500).json({ error: "Failed to fetch transactions" });
   }

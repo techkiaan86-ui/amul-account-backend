@@ -1,13 +1,18 @@
 const express = require('express');
 const router = express.Router();
-const { getVouchers, createVoucher, updateVoucher, deleteVoucher } = require('../controllers/voucherController');
+const { 
+  getVouchers, 
+  updateVoucher,
+  getNextNumberPreview,
+  fixVoucherSeriesRange
+} = require('../controllers/voucherController');
 const { verifyToken } = require('../middlewares/authMiddleware');
 
 router.use(verifyToken);
 
+router.get('/next-number', getNextNumberPreview);
 router.get('/', getVouchers);
-router.post('/', createVoucher);
 router.put('/:id', updateVoucher);
-router.delete('/:id', deleteVoucher);
+router.post('/fix-series', fixVoucherSeriesRange);
 
 module.exports = router;

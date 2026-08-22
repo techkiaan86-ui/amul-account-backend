@@ -20,12 +20,38 @@ const updateBankBalance = async (companyId, paymentMode, amount, type, tx = pris
     const parsedAmount = parseFloat(amount) || 0;
     if (parsedAmount === 0) return null;
 
-    let bank = await tx.bank.findFirst({
-        where: {
-            companyId: companyId,
-            name: { equals: paymentMode }
+    let bank = null;
+    if (paymentMode.toLowerCase() === 'cash') {
+        bank = await tx.bank.findFirst({
+            where: {
+                companyId: companyId,
+                OR: [
+                    { name: 'Cash' },
+                    { type: 'Cash' },
+                    { type: 'CASH BOOK' },
+                    { type: 'WALLET-BOOK' }
+                ]
+            }
+        });
+        if (!bank) {
+            bank = await tx.bank.findFirst({ where: { companyId } });
         }
-    });
+    } else {
+        bank = await tx.bank.findFirst({
+            where: {
+                companyId: companyId,
+                name: paymentMode
+            }
+        });
+        if (!bank) {
+            bank = await tx.bank.findFirst({
+                where: {
+                    companyId: companyId,
+                    name: { contains: paymentMode }
+                }
+            });
+        }
+    }
 
     if (!bank) {
         bank = await tx.bank.create({

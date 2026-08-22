@@ -18,10 +18,32 @@ exports.getLogs = async (req, res) => {
     });
     
     // Map data to match what the frontend expects
-    const formattedLogs = logs.map(log => ({
-      ...log,
-      timestamp: log.createdAt
-    }));
+    const formattedLogs = logs.map(log => {
+      let parsedDetails = {};
+      try {
+        if (log.details && typeof log.details === 'string') {
+          parsedDetails = JSON.parse(log.details);
+        } else if (log.details && typeof log.details === 'object') {
+          parsedDetails = log.details;
+        }
+      } catch (e) {
+        // details might just be a regular string, which is fine
+      }
+      
+      // Fallback to updatedData / previousData if used
+      const parsedUpdatedData = log.updatedData || {};
+      const parsedPreviousData = log.previousData || {};
+
+      return {
+        ...log,
+        timestamp: log.createdAt,
+        userName: log.userName || 'System',
+        billNumber: log.billNumber || parsedDetails.documentNumber || '-',
+        partyName: parsedDetails.partyName || parsedUpdatedData.partyName || '-',
+        amount: parsedDetails.amount ?? parsedUpdatedData.amount ?? null,
+        previousAmount: parsedDetails.previousAmount ?? parsedPreviousData.amount ?? null,
+      };
+    });
     
     res.status(200).json({ success: true, data: formattedLogs });
   } catch (error) {
@@ -33,7 +55,7 @@ exports.getLogs = async (req, res) => {
 // POST /api/v1/audit-logs - create a new audit log
 exports.createLog = async (req, res) => {
   const companyId = req.user.companyId;
-  const userName = req.user.name || 'Unknown User';
+  const userName = req.user.name || req.user.email || req.user.username || String(req.user.id) || 'Unknown User';
   const userRole = req.user.role || 'User';
 
   const {
@@ -52,6 +74,8 @@ exports.createLog = async (req, res) => {
   }
 
   try {
+    const clientIp = req.headers['x-forwarded-for'] ? req.headers['x-forwarded-for'].split(',')[0].trim() : (req.ip || req.socket.remoteAddress);
+
     const newLog = await prisma.auditLog.create({
       data: {
         actionType,
@@ -63,7 +87,7 @@ exports.createLog = async (req, res) => {
         moduleName: moduleName || null,
         previousData: previousData || null,
         updatedData: updatedData || null,
-        ipAddress: ipAddress || req.ip || null,
+        ipAddress: clientIp || null,
         companyId
       }
     });

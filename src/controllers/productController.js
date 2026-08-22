@@ -111,15 +111,27 @@ exports.getProducts = async (req, res) => {
   const limit = parseInt(req.query.limit, 10) || 100000;
   const skip = (page - 1) * limit;
   const warehouseId = req.query.warehouseId ? parseInt(req.query.warehouseId, 10) : null;
+  const barcodeQuery = req.query.barcode ? req.query.barcode.trim() : null;
   try {
+    const whereClause = {
+      companyId,
+      deletedAt: null,
+      ...(barcodeQuery && {
+        OR: [
+          { barcode: barcodeQuery },
+          { sku: barcodeQuery }
+        ]
+      })
+    };
+
     const [products, total, unitConversions, warehouseStocks] = await Promise.all([
       prisma.product.findMany({ 
-        where: { companyId, deletedAt: null }, 
+        where: whereClause, 
         include: { attributeValues: true },
         skip, 
         take: limit 
       }),
-      prisma.product.count({ where: { companyId, deletedAt: null } }),
+      prisma.product.count({ where: whereClause }),
       prisma.unitConversion.findMany({ where: { companyId } }),
       warehouseId ? prisma.warehouseStock.findMany({ where: { warehouseId, companyId } }) : []
     ]);
@@ -301,13 +313,18 @@ exports.updateProduct = async (req, res) => {
     attributeValues
   } = req.body;
   try {
-    const existing = await prisma.product.findUnique({ where: { id: parseInt(id, 10) } });
+    const productId = parseInt(id, 10);
+    if (isNaN(productId)) {
+      return res.status(400).json({ success: false, message: 'Invalid product ID' });
+    }
+
+    const existing = await prisma.product.findUnique({ where: { id: productId } });
     if (!existing || existing.companyId !== companyId) {
       return res.status(404).json({ success: false, message: 'Product not found' });
     }
 
     const product = await prisma.product.update({
-      where: { id: parseInt(id, 10) },
+      where: { id: productId },
       data: {
         ...(name && { name }),
         ...(sku && { sku }),
@@ -516,31 +533,48 @@ exports.getExpiryReport = async (req, res) => {
   const { filter, startDate, endDate } = req.query;
 
   try {
-    const products = await prisma.product.findMany({
-      where: { 
-        companyId,
-        enableExpiry: true,
-        expiryMonth: { not: null, not: "" }
+    const purchaseItems = await prisma.invoiceItem.findMany({
+      where: {
+        invoice: {
+          companyId,
+          type: 'PURCHASE',
+          deletedAt: null
+        },
+        expDate: { not: null, not: "" }
       },
-      select: {
-        id: true,
-        name: true,
-        sku: true,
-        category: true,
-        stock: true,
-        expiryMonth: true
+      include: {
+        product: {
+          select: { id: true, name: true, sku: true, category: true, stock: true }
+        }
       }
     });
+
+    // Deduplicate by productId + expDate
+    const uniqueItemsMap = new Map();
+    purchaseItems.forEach(item => {
+      if (!item.product) return;
+      const key = `${item.productId}_${item.expDate}`;
+      if (!uniqueItemsMap.has(key)) {
+        uniqueItemsMap.set(key, {
+          id: item.id,
+          name: item.product.name,
+          sku: item.product.sku,
+          category: item.product.category,
+          stock: item.product.stock,
+          expiryMonth: item.expDate // map expDate to expiryMonth so UI doesn't break
+        });
+      }
+    });
+
+    const products = Array.from(uniqueItemsMap.values());
 
     // Parse dates and filter in-memory
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
     const filteredProducts = products.filter(p => {
-      // expiryMonth format: DD/MM/YYYY
-      const parts = p.expiryMonth.split('/');
-      if (parts.length !== 3) return false;
-      const expDate = new Date(parts[2], parts[1] - 1, parts[0]);
+      const expDate = new Date(p.expiryMonth);
+      if (isNaN(expDate.getTime())) return false;
       expDate.setHours(0, 0, 0, 0);
 
       const diffTime = expDate - today;
@@ -575,10 +609,8 @@ exports.getExpiryReport = async (req, res) => {
 
     // Sort by expiry date ascending
     filteredProducts.sort((a, b) => {
-      const partsA = a.expiryMonth.split('/');
-      const partsB = b.expiryMonth.split('/');
-      const dateA = new Date(partsA[2], partsA[1] - 1, partsA[0]);
-      const dateB = new Date(partsB[2], partsB[1] - 1, partsB[0]);
+      const dateA = new Date(a.expiryMonth);
+      const dateB = new Date(b.expiryMonth);
       return dateA - dateB;
     });
 

@@ -1,11 +1,6 @@
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
-
-// Helper to generate a simple invoice number
-const generateInvoiceNo = () => {
-  const now = new Date();
-  return `POS-${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}-${now.getTime()}`;
-};
+const { getAndIncrementVoucherNumber } = require('./voucherController');
 
 exports.validateCart = async (req, res) => {
   const companyId = req.user.companyId;
@@ -128,7 +123,7 @@ exports.checkout = async (req, res) => {
 
       const invoice = await tx.invoice.create({
         data: {
-          invoiceNo: generateInvoiceNo(),
+          invoiceNo: await getAndIncrementVoucherNumber(companyId, 'POS Billing', tx),
           date: new Date(),
           type: 'SALES',
           totalAmount: parseFloat(totalAmount) || 0,
@@ -182,11 +177,29 @@ exports.checkout = async (req, res) => {
         }
         // ---------------------------------------------------------
 
+      let customerName = 'Walk-in Customer';
+      if (customerId) {
+        const cust = await tx.customer.findUnique({
+          where: { id: parseInt(customerId, 10) },
+          select: { name: true }
+        });
+        if (cust && cust.name) customerName = cust.name;
+      }
+
       await tx.auditLog.create({
         data: {
           actionType: 'POS_CHECKOUT',
-          details: JSON.stringify({ invoiceNo: invoice.invoiceNo, totalAmount }),
-          userName: req.user.email || 'POS_USER',
+          moduleName: 'POS Billing',
+          billNumber: invoice.invoiceNo,
+          referenceId: String(invoice.id),
+          details: JSON.stringify({ 
+            documentNumber: invoice.invoiceNo, 
+            amount: Number(totalAmount || 0),
+            partyName: customerName
+          }),
+          userName: req.user.name || req.user.email || 'POS_USER',
+          userRole: req.user.role || 'User',
+          ipAddress: req.headers['x-forwarded-for'] ? req.headers['x-forwarded-for'].split(',')[0].trim() : (req.ip || req.socket.remoteAddress),
           companyId,
         },
       });
@@ -226,7 +239,7 @@ exports.processReturns = async (req, res) => {
 
       const returnInvoice = await tx.invoice.create({
         data: {
-          invoiceNo: `RET-${generateInvoiceNo()}`,
+          invoiceNo: await getAndIncrementVoucherNumber(companyId, 'Customer Sale Return', tx),
           date: new Date(),
           type: 'SALES_RETURN',
           totalAmount: totalRefund,

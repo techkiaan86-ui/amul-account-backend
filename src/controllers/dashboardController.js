@@ -33,6 +33,11 @@ exports.getMetrics = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Company ID is required for tenant metrics' });
     }
 
+    const targetDate = req.query.date ? new Date(req.query.date) : new Date();
+    const startOfDay = new Date(targetDate.getFullYear(), targetDate.getMonth(), targetDate.getDate(), 0, 0, 0);
+    const endOfDay = new Date(targetDate.getFullYear(), targetDate.getMonth(), targetDate.getDate(), 23, 59, 59, 999);
+    const dateStr = startOfDay.toISOString().split('T')[0];
+
     const totalCustomers = await prisma.customer.count({ where: { companyId } });
     const totalProducts = await prisma.product.count({ where: { companyId } });
     const totalInvoicesCount = await prisma.invoice.count({ where: { companyId, deletedAt: null } });
@@ -141,23 +146,68 @@ exports.getMetrics = async (req, res) => {
     // --- Alert Cards Data ---
     const allProductsList = await prisma.product.findMany({ 
       where: { companyId }, 
-      select: { stock: true, reorderLevel: true, expiryMonth: true } 
+      select: { stock: true, reorderLevel: true } 
     });
     let reorderCount = 0;
-    let expiredCount = 0;
-    const now = new Date();
-    now.setHours(0, 0, 0, 0);
     allProductsList.forEach(p => {
       if (p.stock <= p.reorderLevel) reorderCount++;
+    });
+
+    const now = new Date();
+    now.setHours(0, 0, 0, 0);
+
+    const expiredProductIds = new Set();
+
+    // 1. Direct Product Level Expiry
+    const expiredDirectProducts = await prisma.product.findMany({
+      where: {
+        companyId: companyId,
+        deletedAt: null,
+        expiryMonth: {
+          not: null,
+          not: ''
+        }
+      },
+      select: { id: true, expiryMonth: true }
+    }).catch(() => []);
+
+    expiredDirectProducts.forEach(p => {
       if (p.expiryMonth) {
-        const parts = p.expiryMonth.split('/');
-        if (parts.length === 3) {
-          const expDate = new Date(parts[2], parts[1] - 1, parts[0]);
-          expDate.setHours(0, 0, 0, 0);
-          if (expDate < now) expiredCount++;
+        const exp = new Date(p.expiryMonth);
+        if (!isNaN(exp.getTime())) {
+          exp.setHours(0, 0, 0, 0);
+          if (exp < now) {
+            expiredProductIds.add(p.id);
+          }
         }
       }
     });
+
+    // 2. Batch / Purchase Item Level Expiry
+    const expiredBatches = await prisma.invoiceItem.findMany({
+      where: {
+        invoice: { companyId: companyId, deletedAt: null },
+        expDate: {
+          not: null,
+          not: ''
+        }
+      },
+      select: { productId: true, expDate: true }
+    }).catch(() => []);
+
+    expiredBatches.forEach(b => {
+      if (b.expDate) {
+        const exp = new Date(b.expDate);
+        if (!isNaN(exp.getTime()) && b.productId) {
+          exp.setHours(0, 0, 0, 0);
+          if (exp < now) {
+            expiredProductIds.add(b.productId);
+          }
+        }
+      }
+    });
+
+    const expiredCount = expiredProductIds.size;
 
     const followupsCount = await prisma.followup.count({
       where: { customer: { companyId } }
@@ -214,6 +264,21 @@ exports.getMetrics = async (req, res) => {
       where: { companyId, deletedAt: { not: null } }
     });
 
+    // Sum expenses from ExpenseTransaction table
+    const expenseTransactionSum = await prisma.expenseTransaction.aggregate({
+      where: {
+        companyId,
+        OR: [
+          { date: { gte: startOfDay, lte: endOfDay } },
+          { createdAt: { gte: startOfDay, lte: endOfDay } }
+        ]
+      },
+      _sum: { paidAmount: true, expenseAmount: true }
+    }).catch(() => ({ _sum: { paidAmount: 0, expenseAmount: 0 } }));
+
+    // Use paidAmount for Today's Expenses as this is what hits the cashbook, or fallback to expenseAmount
+    const totalTodayExpense = Number(expenseTransactionSum?._sum?.paidAmount || expenseTransactionSum?._sum?.expenseAmount || 0);
+
     res.status(200).json({
       success: true,
       data: {
@@ -223,7 +288,9 @@ exports.getMetrics = async (req, res) => {
         todaysSale,
         todayPurchase,
         currentStockStatus,
-        todaysExpenses: todaysExpensesTotal,
+        todaysExpenses: totalTodayExpense,
+        todayExpenses: totalTodayExpense,
+        todayExpense: totalTodayExpense,
         customerOutstanding,
         companyOutstanding,
         allAccountsBalance,

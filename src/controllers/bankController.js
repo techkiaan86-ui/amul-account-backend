@@ -158,7 +158,10 @@ exports.getBankTransactions = async (req, res) => {
         fromBank: true,
         toBank: true
       },
-      orderBy: { date: 'asc' }
+      orderBy: [
+        { date: 'asc' },
+        { id: 'asc' }
+      ]
     });
 
     let entries = [];

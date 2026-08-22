@@ -303,6 +303,7 @@ model InvoiceItem {
   discount1 Float    @default(0)
   discount2 Float    @default(0)
   batchNo   String?
+  description String?   @db.Text
   mfgDate   String?
   expDate   String?
   imei      String?
@@ -498,14 +499,14 @@ model PaymentBook {
 }
 
 model Voucher {
-  id        Int      @id @default(autoincrement())
-  voucherId String
-  type      String
-  head      String
-  companyId Int
-  company   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id          Int      @id @default(autoincrement())
+  voucherType String   @default("Customer Sale")
+  voucherHead String?  @default("")
+  voucherId   Int      @default(1)
+  companyId   Int
+  company     Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 
 @@map("voucher")
 }

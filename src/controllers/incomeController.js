@@ -1,5 +1,6 @@
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
+const { getAndIncrementVoucherNumber } = require('./voucherController');
 
 // Get all incomes for the tenant
 exports.getIncomes = async (req, res) => {
@@ -178,13 +179,14 @@ exports.addIncomeTransaction = async (req, res) => {
     const parsedDiscount = parseFloat(discount) || 0;
 
     const result = await prisma.$transaction(async (tx) => {
+      const voucherNo = await getAndIncrementVoucherNumber(companyId, 'Income Entry', tx);
       const transaction = await tx.incomeTransaction.create({
         data: {
           date: date ? new Date(date) : new Date(),
           incomeAmount: parsedIncome,
           paidAmount: parsedPaid,
           discount: parsedDiscount,
-          remark,
+          remark: remark ? `[${voucherNo}] ${remark}` : `[${voucherNo}]`,
           incomeId,
           companyId
         }
@@ -197,7 +199,7 @@ exports.addIncomeTransaction = async (req, res) => {
         data: { balance: { increment: balanceChange } }
       });
 
-      return transaction;
+      return { ...transaction, voucherNo };
     });
 
     res.status(201).json({ success: true, data: result });

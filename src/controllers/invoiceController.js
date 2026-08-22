@@ -1,10 +1,20 @@
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
+const { getAndIncrementVoucherNumber } = require('./voucherController');
 
-// Helper to generate a simple invoice number
-const generateInvoiceNo = () => {
-  const now = new Date();
-  return `INV-${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}-${now.getTime()}`;
+const mapInvoiceTypeToVoucher = (type) => {
+  switch(type) {
+    case 'SALES': return 'Customer Sale';
+    case 'SALES_RETURN': return 'Customer Sale Return';
+    case 'QUOTATION': return 'Customer Quotation';
+    case 'CHALLAN': return 'Delivery Challan';
+    case 'PURCHASE_ORDER': return 'Company Purchase Order';
+    case 'SALES_ORDER': return 'Customer Sale Order';
+    case 'PURCHASE': return 'Company Purchase';
+    case 'PURCHASE_RETURN': return 'Company Purchase Return';
+    case 'ADJUSTMENT': return 'Stock Adjustment';
+    default: return 'Customer Sale';
+  }
 };
 
 /**
@@ -31,7 +41,8 @@ exports.createInvoice = async (req, res) => {
     tcsAmount,
     items,
     salesperson,
-    commission
+    commission,
+    type
   } = req.body;
 
   if (!Array.isArray(items) || items.length === 0) {
@@ -62,7 +73,7 @@ exports.createInvoice = async (req, res) => {
 
       const customer = await tx.customer.findUnique({
         where: { id: parseInt(customerId, 10) },
-        select: { id: true, companyId: true }
+        select: { id: true, companyId: true, name: true }
       });
       if (!customer || customer.companyId !== companyId) {
         throw new Error('Invalid customer for this company');
@@ -102,7 +113,7 @@ exports.createInvoice = async (req, res) => {
 
       const invoice = await tx.invoice.create({
         data: {
-          invoiceNo: generateInvoiceNo(),
+          invoiceNo: req.body.invoiceNo || await getAndIncrementVoucherNumber(companyId, mapInvoiceTypeToVoucher(type || 'SALES'), tx),
           date: date ? new Date(date) : new Date(),
           subTotal: parseFloat(subTotal) || 0,
           totalDiscount: parseFloat(totalDiscount) || 0,
@@ -158,24 +169,36 @@ exports.createInvoice = async (req, res) => {
             for (const pd of paymentDetails) {
               const amt = parseFloat(pd.amount) || 0;
               const bId = parseInt(pd.bankId, 10);
-              if (amt > 0 && bId && bId !== 9999) {
-                const bankExists = await tx.bank.findFirst({ where: { id: bId, companyId } });
-                if (bankExists) {
-                  let tType = 'IN';
-                  if (invoice.type === 'PURCHASE' || invoice.type === 'SALES_RETURN' || invoice.type === 'EXPENSE') tType = 'OUT';
-                  
+              if (amt > 0) {
+                let tType = 'IN';
+                if (invoice.type === 'PURCHASE' || invoice.type === 'SALES_RETURN' || invoice.type === 'EXPENSE') tType = 'OUT';
+                
+                let targetBank = null;
+                if (bId && bId !== 9999) {
+                  targetBank = await tx.bank.findFirst({ where: { id: bId, companyId } });
+                }
+                if (!targetBank) {
+                  targetBank = await tx.bank.findFirst({ 
+                    where: { 
+                      companyId, 
+                      OR: [{ name: 'Cash' }, { type: 'Cash' }, { type: 'CASH BOOK' }] 
+                    } 
+                  }) || await tx.bank.findFirst({ where: { companyId } });
+                }
+
+                if (targetBank) {
                   await tx.bankTransaction.create({
                     data: {
                       date: invoice.date,
-                      toBankId: tType === 'IN' ? bId : null,
-                      fromBankId: tType === 'OUT' ? bId : null,
+                      toBankId: tType === 'IN' ? targetBank.id : null,
+                      fromBankId: tType === 'OUT' ? targetBank.id : null,
                       amount: amt,
-                      remark: `${invoice.paymentMode} ${invoice.type} - ${invoice.invoiceNo}`,
+                      remark: `${invoice.paymentMode || 'Payment'} ${invoice.type} - ${invoice.invoiceNo}`,
                       companyId
                     }
                   });
                   await tx.bank.update({
-                    where: { id: bId },
+                    where: { id: targetBank.id },
                     data: { balance: { increment: tType === 'IN' ? amt : -amt } }
                   });
                   processedAmount += amt;
@@ -193,11 +216,22 @@ exports.createInvoice = async (req, res) => {
         }
         // -------------------------------------------------------------
 
+      // Audit Log for Create Invoice
+      const partyName = customer ? (customer.name || 'Cash Sale') : 'Cash Sale';
       await tx.auditLog.create({
         data: {
-          actionType: 'CREATE_INVOICE',
-          details: JSON.stringify({ invoiceNo: invoice.invoiceNo, totalAmount }),
-          userName: req.user.email || req.user.id,
+          actionType: 'Create',
+          moduleName: 'Sales Invoice',
+          billNumber: invoice.invoiceNo,
+          referenceId: String(invoice.id),
+          userName: req.user.name || req.user.email || 'Unknown User',
+          userRole: req.user.role || 'User',
+          ipAddress: req.headers['x-forwarded-for'] ? req.headers['x-forwarded-for'].split(',')[0].trim() : (req.ip || req.socket.remoteAddress),
+          details: JSON.stringify({
+            documentNumber: invoice.invoiceNo,
+            partyName: partyName,
+            amount: Number(invoice.totalAmount || 0)
+          }),
           companyId,
         },
       });
@@ -272,9 +306,18 @@ exports.markInvoicePaid = async (req, res) => {
 
     await prisma.auditLog.create({
       data: {
-        actionType: 'MARK_INVOICE_PAID',
-        details: JSON.stringify({ invoiceNo: invoice.invoiceNo }),
-        userName: String(req.user.email || req.user.name || req.user.id),
+        actionType: 'Update',
+        moduleName: 'Sales Invoice',
+        billNumber: invoice.invoiceNo,
+        referenceId: String(invoice.id),
+        userName: String(req.user.name || req.user.email || req.user.id),
+        userRole: req.user.role || 'User',
+        ipAddress: req.headers['x-forwarded-for'] ? req.headers['x-forwarded-for'].split(',')[0].trim() : (req.ip || req.socket.remoteAddress),
+        details: JSON.stringify({
+          documentNumber: invoice.invoiceNo,
+          amount: Number(invoice.totalAmount || 0),
+          changes: 'Marked as PAID'
+        }),
         companyId,
       },
     });
