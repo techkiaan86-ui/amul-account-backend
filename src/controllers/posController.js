@@ -40,7 +40,10 @@ exports.getQuickItems = async (req, res) => {
   const companyId = req.user.companyId;
   try {
     const products = await prisma.product.findMany({
-      where: { companyId, status: 'Active' },
+      where: { 
+        companyId,
+        deletedAt: null
+      },
       take: 20,
       orderBy: { updatedAt: 'desc' }
     });
