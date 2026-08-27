@@ -4,24 +4,63 @@ const prisma = new PrismaClient();
 // Public: Get invoice by invoiceNo (no auth required)
 exports.getPublicBill = async (req, res) => {
   const { invoiceNo } = req.params;
+  const { companyId } = req.query;
 
   try {
-    const invoice = await prisma.invoice.findFirst({
-      where: { invoiceNo: invoiceNo },
-      include: {
-        customer: true,
-        items: {
-          include: {
-            product: true
-          }
+    const isNumericId = !isNaN(Number(invoiceNo)) && Number(invoiceNo) > 0;
+    let invoice = null;
+
+    // 1. Try finding by unique Database ID first if invoiceNo is a numeric ID
+    if (isNumericId) {
+      invoice = await prisma.invoice.findFirst({
+        where: { 
+          id: parseInt(invoiceNo, 10),
+          deletedAt: null 
         },
-        company: {
-          include: {
-            companySetting: true
+        include: {
+          customer: true,
+          items: {
+            include: {
+              product: true
+            }
+          },
+          company: {
+            include: {
+              companySetting: true
+            }
           }
         }
+      });
+    }
+
+    // 2. If not found by ID (e.g., custom voucher string or searched with company filter)
+    if (!invoice) {
+      const whereClause = {
+        invoiceNo: invoiceNo,
+        deletedAt: null
+      };
+      if (companyId && !isNaN(parseInt(companyId, 10))) {
+        whereClause.companyId = parseInt(companyId, 10);
       }
-    });
+
+      invoice = await prisma.invoice.findFirst({
+        where: whereClause,
+        orderBy: { id: 'desc' },
+        include: {
+          customer: true,
+          items: {
+            include: {
+              product: true
+            }
+          },
+          company: {
+            include: {
+              companySetting: true
+            }
+          }
+        }
+      });
+    }
 
     if (!invoice) {
       return res.status(404).json({ success: false, message: 'Bill not found' });
