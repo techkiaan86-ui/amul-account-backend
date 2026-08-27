@@ -183,7 +183,14 @@ exports.getMe = async (req, res) => {
         createdAt: true,
         company: {
           select: {
-            expireDate: true
+            id: true,
+            name: true,
+            address: true,
+            phone: true,
+            ownerEmail: true,
+            logo: true,
+            expireDate: true,
+            companySetting: true
           }
         }
       }

@@ -9,33 +9,15 @@ exports.getPublicBill = async (req, res) => {
     const invoice = await prisma.invoice.findFirst({
       where: { invoiceNo: invoiceNo },
       include: {
-        customer: {
-          select: {
-            name: true,
-            phone: true,
-            mobile: true,
-            address: true,
-            gstin: true,
-          }
-        },
+        customer: true,
         items: {
           include: {
-            product: {
-              select: {
-                name: true,
-                barcode: true,
-                tax: true,
-              }
-            }
+            product: true
           }
         },
         company: {
-          select: {
-            name: true,
-            address: true,
-            phone: true,
-            ownerEmail: true,
-            logo: true,
+          include: {
+            companySetting: true
           }
         }
       }

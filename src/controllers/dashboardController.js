@@ -62,11 +62,33 @@ exports.getMetrics = async (req, res) => {
     const todayPurchase = purchaseAgg._sum.totalAmount || 0;
 
     // Stock Value
-    const allProductsValue = await prisma.product.findMany({
-      where: { companyId, deletedAt: null },
-      select: { stock: true, price: true }
-    });
-    const currentStockStatus = allProductsValue.reduce((sum, p) => sum + ((p.stock || 0) * (p.price || 0)), 0);
+    const [allProductsValue, unitConversions] = await Promise.all([
+      prisma.product.findMany({
+        where: { companyId, deletedAt: null },
+        select: { stock: true, purchasePrice: true, secOpeningQty: true, baseUnit: true, salesUnit: true }
+      }),
+      prisma.unitConversion.findMany({ where: { companyId } })
+    ]);
+
+    const currentStockStatus = allProductsValue.reduce((sum, p) => {
+      const priQty = parseFloat(p.stock || 0) || 0;
+      const secQty = parseFloat(p.secOpeningQty || 0) || 0;
+      const purPrice = parseFloat(p.purchasePrice || 0) || 0;
+      let conv = 1;
+      if (p.baseUnit && p.salesUnit) {
+        const conversion = unitConversions.find(c =>
+          c.baseUnit.toLowerCase() === p.baseUnit.toLowerCase() &&
+          c.targetUnit.toLowerCase() === p.salesUnit.toLowerCase()
+        );
+        if (conversion && conversion.baseQty > 0) {
+          conv = conversion.targetQty / conversion.baseQty;
+        }
+      }
+      if (conv > 1 && secQty > 0) {
+        return sum + (priQty * purPrice) + (secQty * (purPrice / conv));
+      }
+      return sum + (priQty * purPrice);
+    }, 0);
 
     // Outstanding
     const custOutAgg = await prisma.customer.aggregate({
